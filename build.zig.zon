@@ -1,0 +1,11 @@
+.{
+    .name = .gossip_glomers,
+    .version = "0.0.0",
+    .fingerprint = 0xd7b7987d58d159f, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
