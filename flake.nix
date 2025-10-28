@@ -27,7 +27,8 @@
           });
     in {
       devShells = forEachSupportedSystem ({ pkgs }: {
-        default = pkgs.mkShell { packages = with pkgs; [ zig zls ]; };
+        default =
+          pkgs.mkShell { packages = with pkgs; [ zig zls maelstrom-clj ]; };
       });
     };
 }
