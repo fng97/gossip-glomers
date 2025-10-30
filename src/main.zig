@@ -1,13 +1,9 @@
 const std = @import("std");
 
-// TODO: Figure out how to use `std.json.Reader`.
+// TODO: Figure out how to use `std.json.Reader.init`: `std.json.parseFromTokenSource`.
+// TODO: If I'm sticking with the arena allocator, I should use the `Leaky` `json` methods.
 
 pub const std_options: std.Options = .{ .log_level = .debug, .logFn = logFn };
-
-var message_count = std.atomic.Value(usize).init(1);
-pub fn new_id() usize {
-    return message_count.fetchAdd(1, .monotonic);
-}
 
 pub fn main() !void {
     var arena_state: std.heap.ArenaAllocator = .init(std.heap.page_allocator);
@@ -17,65 +13,17 @@ pub fn main() !void {
     var stdin_buffer: [1024]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
     const stdin = &stdin_reader.interface;
+
+    // TODO: Use a buffered writer. When do you flush?
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
 
-    // Handle initialisation message: parse node ID and respond with `init_ok`.
-    const node_id: []const u8 = id: {
-        const line = try stdin.takeDelimiterInclusive('\n');
-        // std.log.debug("Received stdin line: {s}", .{line[0..line.len]});
+    var node: Node = try .init(arena, stdin, stdout);
+    defer node.deinit();
 
-        const parsed = try std.json.parseFromSlice(Message, arena, line, .{});
-        defer parsed.deinit();
-        const init = parsed.value;
-        std.log.debug("I am node {s}", .{init.body.init.node_id});
-        const joined = try std.mem.join(arena, ", ", init.body.init.node_ids);
-        defer arena.free(joined);
-        std.log.debug("Nodes in cluster: {s}", .{joined});
+    while (true) try node.tick();
 
-        const response = Message{
-            .src = init.body.init.node_id,
-            .dest = init.src,
-            .body = .{ .init_ok = .{
-                .type = .init_ok,
-                .in_reply_to = init.body.init.msg_id,
-            } },
-        };
-        const response_formatted = std.json.fmt(response, .{ .emit_null_optional_fields = false });
-        // std.log.debug("Sending stdout line: {f}", .{response_formatted});
-        try stdout.print("{f}\n", .{response_formatted});
-        break :id try arena.dupe(u8, init.body.init.node_id);
-    };
-
-    while (true) {
-        const line = try stdin.takeDelimiterInclusive('\n');
-        std.log.debug("Received stdin line: {s}", .{line});
-
-        const parsed = try std.json.parseFromSlice(
-            Message,
-            arena,
-            line,
-            .{},
-        );
-        defer parsed.deinit();
-        const message = parsed.value;
-
-        const response = Message{
-            .src = node_id,
-            .dest = message.src,
-            .body = .{ .echo_ok = .{
-                .type = .echo_ok,
-                .msg_id = new_id(),
-                .in_reply_to = message.body.echo.msg_id,
-                .echo = message.body.echo.echo,
-            } },
-        };
-        const response_formatted = std.json.fmt(response, .{ .emit_null_optional_fields = false });
-        std.log.debug("Sending stdout line: {f}", .{response_formatted});
-        try stdout.print("{f}\n", .{response_formatted});
-    }
-
-    std.log.debug("{s}", .{"some info"});
+    @panic("Exited event loop");
 }
 
 /// See https://ziglang.org/documentation/0.15.2/std/#std.log.
@@ -92,29 +40,108 @@ fn logFn(
     nosuspend stderr_writer.interface.print(prefix ++ format ++ "\n", args) catch return;
 }
 
-// TODO: Can we create the Body type from a list of types (maybe anonymous as below) and have the
-// `type` fields and values and the `msg_id` field automatically added? Could have an interface like
+// TODO: Use *reflection* to create the Body union from a list of structs (maybe anonymous as
+// below). It should use the `type` field to determine the union tag. Maybe worth sticking in
+// `mst_id` by default? Same for `in_reply_to` where the tag has `_ok`? Could have an interface like
 // this:
 //
 // const _ = BodyFromKinds(.{
-//     .init = struct { node_id: usize, node_ids: []usize },
-//     .echo = struct { echo: []const u8 },
+//     struct { kind: Kind = .init, node_id: usize, node_ids: []usize },
+//     struct { kind: Kind = .echo, echo: []const u8 },
 // });
 
-pub const Message = struct {
-    id: ?usize = null, // maelstrom includes this field on init for some reason
+const Node = struct {
+    allocator: std.mem.Allocator,
+    reader: *std.Io.Reader,
+    writer: *std.Io.Writer,
+
+    id: []const u8,
+    /// Counter for IDs for messages sent from this node.
+    msg_count: std.atomic.Value(usize) = .init(1),
+
+    fn read(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
+        const line = try reader.takeDelimiterInclusive('\n');
+        const parsed = try std.json.parseFromSlice(Message, allocator, line, .{
+            // Maelstrom includes a top-level "id" field on init for some reason.
+            .ignore_unknown_fields = true,
+        });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
+    /// Read initialisation message, set node ID, and respond with `init_ok`.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        reader: *std.Io.Reader,
+        writer: *std.Io.Writer,
+    ) !Node {
+        const msg = try read(allocator, reader);
+        std.log.debug("Received init msg. I am node {s}", .{msg.body.init.node_id});
+
+        const other_nodes = try std.mem.join(allocator, ", ", msg.body.init.node_ids);
+        defer allocator.free(other_nodes);
+        std.log.debug("Nodes in cluster: {s}", .{other_nodes});
+
+        // Reply with init_ok ack.
+        try writer.print("{f}\n", .{std.json.fmt(Message{
+            .src = msg.body.init.node_id,
+            .dest = msg.src,
+            .body = .{
+                .init_ok = .{
+                    .type = .init_ok,
+                    .in_reply_to = msg.body.init.msg_id,
+                },
+            },
+        }, .{})});
+
+        return .{
+            .allocator = allocator,
+            .reader = reader,
+            .writer = writer,
+            .id = try allocator.dupe(u8, msg.body.init.node_id),
+        };
+    }
+
+    pub fn tick(n: *Node) !void {
+        const msg = try read(n.allocator, n.reader);
+
+        const response = Message{
+            .src = n.id,
+            .dest = msg.src,
+            .body = .{ .echo_ok = .{
+                .type = .echo_ok,
+                .msg_id = n.new_id(),
+                .in_reply_to = msg.body.echo.msg_id,
+                .echo = msg.body.echo.echo,
+            } },
+        };
+        try n.writer.print("{f}\n", .{std.json.fmt(response, .{})});
+    }
+
+    pub fn deinit(n: *Node) void {
+        n.allocator.free(n.id);
+    }
+
+    fn new_id(n: *Node) usize {
+        return n.msg_count.fetchAdd(1, .monotonic);
+    }
+};
+
+const Message = struct {
     src: []const u8,
     dest: []const u8,
     body: Body,
 
-    pub const Kind = enum {
+    /// The message type. We're calling it `Kind` because `type` is a Zig keyword. These *must*
+    /// match the `"type"` strings in the message `"body"` object.
+    const Kind = enum {
         init,
         init_ok,
         echo,
         echo_ok,
     };
 
-    pub const Body = union(Kind) {
+    const Body = union(enum) {
         init: struct {
             type: Kind = .init,
             msg_id: usize,
@@ -176,17 +203,17 @@ pub const Message = struct {
             allocator: std.mem.Allocator,
             source: anytype,
             options: std.json.ParseOptions,
-        ) !@This() {
+        ) !Body {
             const value = try std.json.Value.jsonParse(allocator, source, options);
             const kind = value.object.get("type").?.string;
 
             // If a field in the union matches the "type" of this object, serialise the object as
             // the type that `kind` corresponds to. This relies on the `Message.Kind` tag
             // (`field.name`) matching the value of "type".
-            const type_info = @typeInfo(@This()).@"union";
+            const type_info = @typeInfo(Body).@"union";
             inline for (type_info.fields) |field| if (std.mem.eql(u8, field.name, kind)) {
                 return @unionInit(
-                    @This(),
+                    Body,
                     field.name,
                     try std.json.innerParseFromValue(field.type, allocator, value, options),
                 );
@@ -197,8 +224,8 @@ pub const Message = struct {
 
         /// Define serialisation for the same reasons deserialisation was defined above. Instead of
         /// nesting this tagged union's value in a tag key (the default), write the value directly.
-        pub fn jsonStringify(this: @This(), writer: anytype) !void {
-            switch (this) {
+        pub fn jsonStringify(b: Body, writer: anytype) !void {
+            switch (b) {
                 inline else => |body| try writer.write(body),
             }
         }
