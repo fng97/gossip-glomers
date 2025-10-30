@@ -57,9 +57,9 @@ const Node = struct {
 
     id: []const u8,
     /// Counter for IDs for messages sent from this node.
-    msg_count: std.atomic.Value(usize) = .init(1),
+    msg_count: usize = 1,
 
-    fn read(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
+    fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
         const line = try reader.takeDelimiterInclusive('\n');
         const parsed = try std.json.parseFromSlice(Message, allocator, line, .{
             // Maelstrom includes a top-level "id" field on init for some reason.
@@ -69,21 +69,32 @@ const Node = struct {
         return parsed.value;
     }
 
+    fn send(n: *Node, msg: Message) !void {
+        try n.writer.print("{f}\n", .{std.json.fmt(msg, .{})});
+    }
+
     /// Read initialisation message, set node ID, and respond with `init_ok`.
     pub fn init(
         allocator: std.mem.Allocator,
         reader: *std.Io.Reader,
         writer: *std.Io.Writer,
     ) !Node {
-        const msg = try read(allocator, reader);
-        std.log.debug("Received init msg. I am node {s}", .{msg.body.init.node_id});
+        const msg = try recv(allocator, reader);
 
+        std.log.debug("Received init msg. I am node {s}", .{msg.body.init.node_id});
         const other_nodes = try std.mem.join(allocator, ", ", msg.body.init.node_ids);
         defer allocator.free(other_nodes);
         std.log.debug("Nodes in cluster: {s}", .{other_nodes});
 
+        var n: Node = .{
+            .allocator = allocator,
+            .reader = reader,
+            .writer = writer,
+            .id = try allocator.dupe(u8, msg.body.init.node_id),
+        };
+
         // Reply with init_ok ack.
-        try writer.print("{f}\n", .{std.json.fmt(Message{
+        try n.send(.{
             .src = msg.body.init.node_id,
             .dest = msg.src,
             .body = .{
@@ -92,38 +103,54 @@ const Node = struct {
                     .in_reply_to = msg.body.init.msg_id,
                 },
             },
-        }, .{})});
+        });
 
-        return .{
-            .allocator = allocator,
-            .reader = reader,
-            .writer = writer,
-            .id = try allocator.dupe(u8, msg.body.init.node_id),
-        };
+        return n;
     }
 
     pub fn tick(n: *Node) !void {
-        const msg = try read(n.allocator, n.reader);
+        const msg = try recv(n.allocator, n.reader);
 
-        const response = Message{
-            .src = n.id,
-            .dest = msg.src,
-            .body = .{ .echo_ok = .{
-                .type = .echo_ok,
-                .msg_id = n.new_id(),
-                .in_reply_to = msg.body.echo.msg_id,
-                .echo = msg.body.echo.echo,
-            } },
-        };
-        try n.writer.print("{f}\n", .{std.json.fmt(response, .{})});
+        switch (msg.body) {
+            .echo => |b| try n.send(.{
+                .src = n.id,
+                .dest = msg.src,
+                .body = .{
+                    .echo_ok = .{
+                        .msg_id = n.msg_id(),
+                        .in_reply_to = b.msg_id,
+                        .echo = b.echo,
+                    },
+                },
+            }),
+            .generate => |b| try n.send(.{
+                .src = n.id,
+                .dest = msg.src,
+                .body = .{
+                    .generate_ok = .{
+                        .msg_id = n.msg_id(),
+                        .in_reply_to = b.msg_id,
+                        .id = new_id(),
+                    },
+                },
+            }),
+            .init => unreachable,
+            .echo_ok, .init_ok, .generate_ok => unreachable,
+        }
     }
 
     pub fn deinit(n: *Node) void {
         n.allocator.free(n.id);
     }
 
-    fn new_id(n: *Node) usize {
-        return n.msg_count.fetchAdd(1, .monotonic);
+    fn msg_id(n: *Node) usize {
+        const id = n.msg_count;
+        n.msg_count += 1;
+        return id;
+    }
+
+    fn new_id() usize {
+        return std.crypto.random.int(usize);
     }
 };
 
@@ -139,6 +166,8 @@ const Message = struct {
         init_ok,
         echo,
         echo_ok,
+        generate,
+        generate_ok,
     };
 
     const Body = union(enum) {
@@ -162,6 +191,16 @@ const Message = struct {
             msg_id: usize,
             echo: []const u8,
             in_reply_to: usize,
+        },
+        generate: struct {
+            type: Kind = .generate,
+            msg_id: usize,
+        },
+        generate_ok: struct {
+            type: Kind = .generate_ok,
+            msg_id: usize,
+            in_reply_to: usize,
+            id: usize,
         },
 
         /// Define the parsing of this tagged union (as opposed to using the default) because the
