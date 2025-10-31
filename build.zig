@@ -41,6 +41,15 @@ pub fn build(b: *std.Build) void {
     });
     unique_ids.addPrefixedArtifactArg("--bin=", exe);
     test_step.dependOn(&unique_ids.step);
+    const broadcast_a = b.addSystemCommand(&.{
+        "maelstrom",    "test",
+        "--workload",   "broadcast",
+        "--rate",       "10",
+        "--node-count", "1",
+        "--time-limit", "20",
+    });
+    broadcast_a.addPrefixedArtifactArg("--bin=", exe);
+    test_step.dependOn(&broadcast_a.step);
 
     // See https://zigtools.org/zls/guides/build-on-save/.
     const check_step = b.step("check", "Check if everything compiles");

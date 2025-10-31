@@ -56,8 +56,10 @@ const Node = struct {
     writer: *std.Io.Writer,
 
     id: []const u8,
+    // peers: []const []const u8,
     /// Counter for IDs for messages sent from this node.
     msg_count: usize = 1,
+    msgs: std.ArrayList(isize) = .empty,
 
     fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
         const line = try reader.takeDelimiterInclusive('\n');
@@ -91,6 +93,7 @@ const Node = struct {
             .reader = reader,
             .writer = writer,
             .id = try allocator.dupe(u8, msg.body.init.node_id),
+            // .peers = try allocator.dupe(u8, msg.body.init.node_ids),
         };
 
         // Reply with init_ok ack.
@@ -106,6 +109,12 @@ const Node = struct {
         });
 
         return n;
+    }
+
+    pub fn deinit(n: *Node) void {
+        n.allocator.free(n.id);
+        defer n.msgs.deinit(n.allocator);
+        // n.allocator.free(n.peers);
     }
 
     pub fn tick(n: *Node) !void {
@@ -134,13 +143,50 @@ const Node = struct {
                     },
                 },
             }),
-            .init => unreachable,
-            .echo_ok, .init_ok, .generate_ok => unreachable,
+            .broadcast => |b| {
+                try n.msgs.append(n.allocator, b.message);
+                try n.send(.{
+                    .src = n.id,
+                    .dest = msg.src,
+                    .body = .{
+                        .broadcast_ok = .{
+                            .msg_id = n.msg_id(),
+                            .in_reply_to = b.msg_id,
+                        },
+                    },
+                });
+            },
+            .topology => |b| try n.send(.{
+                .src = n.id,
+                .dest = msg.src,
+                .body = .{
+                    // TODO: Store topology? Don't we get this at the start?
+                    .topology_ok = .{
+                        .msg_id = n.msg_id(),
+                        .in_reply_to = b.msg_id,
+                    },
+                },
+            }),
+            .read => |b| try n.send(.{
+                .src = n.id,
+                .dest = msg.src,
+                .body = .{
+                    .read_ok = .{
+                        .msg_id = n.msg_id(),
+                        .in_reply_to = b.msg_id,
+                        .messages = n.msgs.items,
+                    },
+                },
+            }),
+            .init => @panic("Received second init message"),
+            .echo_ok,
+            .init_ok,
+            .generate_ok,
+            .broadcast_ok,
+            .read_ok,
+            .topology_ok,
+            => std.debug.panic("Received unexpected message: {s}", .{@tagName(msg.body)}),
         }
-    }
-
-    pub fn deinit(n: *Node) void {
-        n.allocator.free(n.id);
     }
 
     fn msg_id(n: *Node) usize {
@@ -168,8 +214,19 @@ const Message = struct {
         echo_ok,
         generate,
         generate_ok,
+        broadcast,
+        broadcast_ok,
+        read,
+        read_ok,
+        topology,
+        topology_ok,
     };
 
+    // TODO: Move the tagged union down a level? Could make body a normal struct with all the common
+    // fields (`type`, `msg_id`, and for replies, `in_reply_to`) then include another field
+    // called `extra_fields`: the tagged union with tag-specific fields. This would make generating
+    // types a lot easier. It would also make handling replies a lot easier because you can just
+    // pass in the tag-specific fields and have the rest handled by the reply.
     const Body = union(enum) {
         init: struct {
             type: Kind = .init,
@@ -201,6 +258,37 @@ const Message = struct {
             msg_id: usize,
             in_reply_to: usize,
             id: usize,
+        },
+        broadcast: struct {
+            type: Kind = .broadcast,
+            msg_id: usize,
+            message: isize,
+        },
+        broadcast_ok: struct {
+            type: Kind = .broadcast_ok,
+            msg_id: usize,
+            in_reply_to: usize,
+        },
+        read: struct {
+            type: Kind = .read,
+            msg_id: usize,
+        },
+        read_ok: struct {
+            type: Kind = .read_ok,
+            msg_id: usize,
+            in_reply_to: usize,
+            messages: []isize,
+        },
+        topology: struct {
+            type: Kind = .topology,
+            msg_id: usize,
+            // TODO: Use tags for node/client ids? Ignore for now.
+            // topology: []struct {},
+        },
+        topology_ok: struct {
+            type: Kind = .topology_ok,
+            msg_id: usize,
+            in_reply_to: usize,
         },
 
         /// Define the parsing of this tagged union (as opposed to using the default) because the
