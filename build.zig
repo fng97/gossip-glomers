@@ -50,11 +50,4 @@ pub fn build(b: *std.Build) void {
     });
     broadcast_a.addPrefixedArtifactArg("--bin=", exe);
     test_step.dependOn(&broadcast_a.step);
-
-    // See https://zigtools.org/zls/guides/build-on-save/.
-    const check_step = b.step("check", "Check if everything compiles");
-    const check_exe = b.addExecutable(.{ .name = "check", .root_module = exe.root_module });
-    const check_tests = b.addTest(.{ .root_module = exe.root_module });
-    check_step.dependOn(&check_exe.step);
-    check_step.dependOn(&check_tests.step);
 }
