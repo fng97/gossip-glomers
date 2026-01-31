@@ -22,32 +22,39 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{ .root_module = exe.root_module });
     const run_exe_tests = b.addRunArtifact(exe_tests);
     test_step.dependOn(&run_exe_tests.step);
+
+    const echo_step = b.step("echo", "Run echo workload");
     const echo = b.addSystemCommand(&.{
         "maelstrom",    "test",
         "--workload",   "echo",
+        "--rate",       "50",
         "--node-count", "1",
-        "--time-limit", "10",
+        "--time-limit", "3",
     });
     echo.addPrefixedArtifactArg("--bin=", exe);
-    test_step.dependOn(&echo.step);
-    const unique_ids = b.addSystemCommand(&.{
+    echo_step.dependOn(&echo.step);
+
+    const generate_step = b.step("generate", "Run generate workload");
+    const generate = b.addSystemCommand(&.{
         "maelstrom",      "test",
         "--workload",     "unique-ids",
-        "--rate",         "1000",
+        "--rate",         "10000",
         "--node-count",   "3",
-        "--time-limit",   "30",
+        "--time-limit",   "3",
         "--availability", "total",
         "--nemesis",      "partition",
     });
-    unique_ids.addPrefixedArtifactArg("--bin=", exe);
-    test_step.dependOn(&unique_ids.step);
+    generate.addPrefixedArtifactArg("--bin=", exe);
+    generate_step.dependOn(&generate.step);
+
+    const broadcast_step = b.step("broadcast", "Run broadcast workload");
     const broadcast_a = b.addSystemCommand(&.{
         "maelstrom",    "test",
         "--workload",   "broadcast",
-        "--rate",       "10",
+        "--rate",       "100",
         "--node-count", "1",
-        "--time-limit", "20",
+        "--time-limit", "3",
     });
     broadcast_a.addPrefixedArtifactArg("--bin=", exe);
-    test_step.dependOn(&broadcast_a.step);
+    broadcast_step.dependOn(&broadcast_a.step);
 }
