@@ -14,7 +14,7 @@ pub fn main() !void {
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
     const stdin = &stdin_reader.interface;
 
-    // TODO: Use a buffered writer. When do you flush?
+    // TODO: Use a buffered writer. When do you flush? End of tick?
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
 
@@ -26,7 +26,8 @@ pub fn main() !void {
     @panic("Exited event loop");
 }
 
-/// See https://ziglang.org/documentation/0.15.2/std/#std.log.
+// Messages are sent and received from stdout and stdin respectively. Logs go to stderr so override
+// the default logger (uses stdout).
 fn logFn(
     comptime level: std.log.Level,
     comptime _: @TypeOf(.EnumLiteral),
@@ -39,16 +40,6 @@ fn logFn(
     var stderr_writer = std.fs.File.stderr().writer(&.{});
     nosuspend stderr_writer.interface.print(prefix ++ format ++ "\n", args) catch return;
 }
-
-// TODO: Use *reflection* to create the Body union from a list of structs (maybe anonymous as
-// below). It should use the `type` field to determine the union tag. Maybe worth sticking in
-// `mst_id` by default? Same for `in_reply_to` where the tag has `_ok`? Could have an interface like
-// this:
-//
-// const _ = BodyFromKinds(.{
-//     struct { kind: Kind = .init, node_id: usize, node_ids: []usize },
-//     struct { kind: Kind = .echo, echo: []const u8 },
-// });
 
 const Node = struct {
     allocator: std.mem.Allocator,
@@ -83,8 +74,8 @@ const Node = struct {
     ) !Node {
         const msg = try recv(allocator, reader);
 
-        std.log.debug("Received init msg. I am node {s}", .{msg.body.init.node_id});
-        const other_nodes = try std.mem.join(allocator, ", ", msg.body.init.node_ids);
+        std.log.debug("Received init msg. I am node {s}", .{msg.body.extra.init.node_id});
+        const other_nodes = try std.mem.join(allocator, ", ", msg.body.extra.init.node_ids);
         defer allocator.free(other_nodes);
         std.log.debug("Nodes in cluster: {s}", .{other_nodes});
 
@@ -92,19 +83,18 @@ const Node = struct {
             .allocator = allocator,
             .reader = reader,
             .writer = writer,
-            .id = try allocator.dupe(u8, msg.body.init.node_id),
-            // .peers = try allocator.dupe(u8, msg.body.init.node_ids),
+            .id = try allocator.dupe(u8, msg.body.extra.init.node_id),
+            // .peers = try allocator.dupe(u8, msg.body.extra.init.node_ids),
         };
 
         // Reply with init_ok ack.
         try n.send(.{
-            .src = msg.body.init.node_id,
+            .src = msg.body.extra.init.node_id,
             .dest = msg.src,
             .body = .{
-                .init_ok = .{
-                    .type = .init_ok,
-                    .in_reply_to = msg.body.init.msg_id,
-                },
+                .type = .init_ok,
+                .in_reply_to = msg.body.msg_id,
+                .extra = .{ .init_ok = .{} },
             },
         });
 
@@ -120,27 +110,25 @@ const Node = struct {
     pub fn tick(n: *Node) !void {
         const msg = try recv(n.allocator, n.reader);
 
-        switch (msg.body) {
-            .echo => |b| try n.send(.{
+        switch (msg.body.extra) {
+            .echo => |e| try n.send(.{
                 .src = n.id,
                 .dest = msg.src,
                 .body = .{
-                    .echo_ok = .{
-                        .msg_id = n.msg_id(),
-                        .in_reply_to = b.msg_id,
-                        .echo = b.echo,
-                    },
+                    .type = .echo_ok,
+                    .msg_id = n.msg_id(),
+                    .in_reply_to = msg.body.msg_id,
+                    .extra = .{ .echo_ok = .{ .echo = e.echo } },
                 },
             }),
-            .generate => |b| try n.send(.{
+            .generate => try n.send(.{
                 .src = n.id,
                 .dest = msg.src,
                 .body = .{
-                    .generate_ok = .{
-                        .msg_id = n.msg_id(),
-                        .in_reply_to = b.msg_id,
-                        .id = new_id(),
-                    },
+                    .type = .generate_ok,
+                    .msg_id = n.msg_id(),
+                    .in_reply_to = msg.body.msg_id,
+                    .extra = .{ .generate_ok = .{ .id = new_id() } },
                 },
             }),
             .broadcast => |b| {
@@ -149,33 +137,32 @@ const Node = struct {
                     .src = n.id,
                     .dest = msg.src,
                     .body = .{
-                        .broadcast_ok = .{
-                            .msg_id = n.msg_id(),
-                            .in_reply_to = b.msg_id,
-                        },
+                        .type = .broadcast_ok,
+                        .msg_id = n.msg_id(),
+                        .in_reply_to = msg.body.msg_id,
+                        .extra = .{ .broadcast_ok = .{} },
                     },
                 });
             },
-            .topology => |b| try n.send(.{
+            .topology => try n.send(.{
                 .src = n.id,
                 .dest = msg.src,
                 .body = .{
                     // TODO: Store topology? Don't we get this at the start?
-                    .topology_ok = .{
-                        .msg_id = n.msg_id(),
-                        .in_reply_to = b.msg_id,
-                    },
+                    .type = .topology_ok,
+                    .msg_id = n.msg_id(),
+                    .in_reply_to = msg.body.msg_id,
+                    .extra = .{ .topology_ok = .{} },
                 },
             }),
-            .read => |b| try n.send(.{
+            .read => try n.send(.{
                 .src = n.id,
                 .dest = msg.src,
                 .body = .{
-                    .read_ok = .{
-                        .msg_id = n.msg_id(),
-                        .in_reply_to = b.msg_id,
-                        .messages = n.msgs.items,
-                    },
+                    .type = .read_ok,
+                    .msg_id = n.msg_id(),
+                    .in_reply_to = msg.body.msg_id,
+                    .extra = .{ .read_ok = .{ .messages = n.msgs.items } },
                 },
             }),
             .init => @panic("Received second init message"),
@@ -185,7 +172,7 @@ const Node = struct {
             .broadcast_ok,
             .read_ok,
             .topology_ok,
-            => std.debug.panic("Received unexpected message: {s}", .{@tagName(msg.body)}),
+            => std.debug.panic("Received unexpected message: {s}", .{@tagName(msg.body.extra)}),
         }
     }
 
@@ -222,145 +209,147 @@ const Message = struct {
         topology_ok,
     };
 
-    // TODO: Move the tagged union down a level? Could make body a normal struct with all the common
-    // fields (`type`, `msg_id`, and for replies, `in_reply_to`) then include another field
-    // called `extra_fields`: the tagged union with tag-specific fields. This would make generating
-    // types a lot easier. It would also make handling replies a lot easier because you can just
-    // pass in the tag-specific fields and have the rest handled by the reply.
-    const Body = union(enum) {
-        init: struct {
-            type: Kind = .init,
-            msg_id: usize,
-            node_id: []const u8,
-            node_ids: []const []const u8,
-        },
-        init_ok: struct {
-            type: Kind = .init_ok,
-            in_reply_to: usize,
-        },
-        echo: struct {
-            type: Kind = .echo,
-            msg_id: usize,
-            echo: []const u8,
-        },
-        echo_ok: struct {
-            type: Kind = .echo_ok,
-            msg_id: usize,
-            echo: []const u8,
-            in_reply_to: usize,
-        },
-        generate: struct {
-            type: Kind = .generate,
-            msg_id: usize,
-        },
-        generate_ok: struct {
-            type: Kind = .generate_ok,
-            msg_id: usize,
-            in_reply_to: usize,
-            id: usize,
-        },
-        broadcast: struct {
-            type: Kind = .broadcast,
-            msg_id: usize,
-            message: isize,
-        },
-        broadcast_ok: struct {
-            type: Kind = .broadcast_ok,
-            msg_id: usize,
-            in_reply_to: usize,
-        },
-        read: struct {
-            type: Kind = .read,
-            msg_id: usize,
-        },
-        read_ok: struct {
-            type: Kind = .read_ok,
-            msg_id: usize,
-            in_reply_to: usize,
-            messages: []isize,
-        },
-        topology: struct {
-            type: Kind = .topology,
-            msg_id: usize,
-            // TODO: Use tags for node/client ids? Ignore for now.
-            // topology: []struct {},
-        },
-        topology_ok: struct {
-            type: Kind = .topology_ok,
-            msg_id: usize,
-            in_reply_to: usize,
-        },
+    const Body = struct {
+        type: Kind,
+        msg_id: ?usize = null,
+        in_reply_to: ?usize = null,
+        extra: Extra,
 
-        /// Define the parsing of this tagged union (as opposed to using the default) because the
-        /// expected schema does not nest the object under the tag.
-        ///
-        /// Zig expects something like (note the first "echo" key):
-        ///
-        /// ```
-        /// {
-        ///   "src": "c1",
-        ///   "dest": "n1",
-        ///   "body": {
-        ///     "echo": {
-        ///       "type": "echo",
-        ///       "msg_id": 1,
-        ///       "echo": "Please echo 35"
-        ///     }
-        ///   }
-        /// }
-        /// ```
-        ///
-        /// but we get something like this:
-        ///
-        /// ```
-        /// {
-        ///   "src": "c1",
-        ///   "dest": "n1",
-        ///   "body": {
-        ///     "type": "echo",
-        ///     "msg_id": 1,
-        ///     "echo": "Please echo 35"
-        ///   }
-        /// }
-        /// ```
-        ///
-        /// To parse, we can first check the `Kind` assigned to "type" (which is always included)
-        /// and parse the value as the type it corresponds to.
+        const Extra = union(Kind) {
+            init: struct {
+                node_id: []const u8,
+                node_ids: []const []const u8,
+            },
+            init_ok: struct {},
+            echo: struct {
+                echo: []const u8,
+            },
+            echo_ok: struct {
+                echo: []const u8,
+            },
+            generate: struct {},
+            generate_ok: struct {
+                id: usize,
+            },
+            broadcast: struct {
+                message: isize,
+            },
+            broadcast_ok: struct {},
+            read: struct {},
+            read_ok: struct {
+                messages: []isize,
+            },
+            topology: struct {
+                // TODO: Use tags for node/client ids? Ignore for now.
+                // topology: []struct {},
+            },
+            topology_ok: struct {},
+
+            // FIXME: Fix these docs.
+            /// Define the parsing of this tagged union. The default parsinge expects the object to
+            /// be nested under the tag but the extra fields exist in the parent object. The parent
+            /// Body struct will parse common fields (type, msg_id, in_reply_to) using defaults, and
+            /// we handle the tag-specific fields here based on the "type" field.
+            pub fn jsonParseFromValue(
+                allocator: std.mem.Allocator,
+                value: std.json.Value,
+                options: std.json.ParseOptions,
+            ) !Extra {
+                const kind = value.object.get("type").?.string;
+
+                // If a field in the union matches the "type" of this object, parse the object as
+                // the type that `kind` corresponds to.
+                const type_info = @typeInfo(Extra).@"union";
+                inline for (type_info.fields) |field| if (std.mem.eql(u8, field.name, kind)) {
+                    return @unionInit(
+                        Extra,
+                        field.name,
+                        try std.json.innerParseFromValue(field.type, allocator, value, options),
+                    );
+                };
+
+                return error.UnknownField;
+            }
+
+            /// Define serialisation for the same reasons deserialisation was defined above. Instead
+            /// of nesting this tagged union's value in a tag key (the default), write the value
+            /// directly.
+            pub fn jsonStringify(e: Extra, writer: anytype) !void {
+                switch (e) {
+                    inline else => |extra| try writer.write(extra),
+                }
+            }
+        };
+
+        /// Define custom parsing to handle flattened structure. The JSON has all fields
+        /// at the same level, so we parse common fields and delegate extra fields to Extra.
         pub fn jsonParse(
             allocator: std.mem.Allocator,
             source: anytype,
             options: std.json.ParseOptions,
         ) !Body {
+            // Parse the entire value first
             const value = try std.json.Value.jsonParse(allocator, source, options);
-            const kind = value.object.get("type").?.string;
+            const obj = value.object;
 
-            // If a field in the union matches the "type" of this object, serialise the object as
-            // the type that `kind` corresponds to. This relies on the `Message.Kind` tag
-            // (`field.name`) matching the value of "type".
-            const type_info = @typeInfo(Body).@"union";
-            inline for (type_info.fields) |field| if (std.mem.eql(u8, field.name, kind)) {
-                return @unionInit(
-                    Body,
-                    field.name,
-                    try std.json.innerParseFromValue(field.type, allocator, value, options),
-                );
+            // Extract common fields
+            const kind_str = obj.get("type").?.string;
+            const kind = std.meta.stringToEnum(Kind, kind_str) orelse return error.UnknownField;
+            const msg_id = if (obj.get("msg_id")) |v| @as(usize, @intCast(v.integer)) else null;
+            const in_reply_to = if (obj.get("in_reply_to")) |v| @as(usize, @intCast(v.integer)) else null;
+
+            // Parse extra fields using the entire value (Extra.jsonParse will extract what it needs)
+            var o = options;
+            o.ignore_unknown_fields = true;
+            const extra = try std.json.innerParseFromValue(Extra, allocator, value, o);
+
+            return Body{
+                .type = kind,
+                .msg_id = msg_id,
+                .in_reply_to = in_reply_to,
+                .extra = extra,
             };
-
-            return error.UnknownField;
         }
 
-        /// Define serialisation for the same reasons deserialisation was defined above. Instead of
-        /// nesting this tagged union's value in a tag key (the default), write the value directly.
+        /// Overload serialisation to flatten all fields: serialise `Extra` at the level of its
+        /// parent. We write the common fields (type, msg_id, in_reply_to) first. We then write
+        /// `Extra`'s fields if they exist. `init_ok`, for example, doesn't have any `Extra` fields
+        /// so only the common fields are serialised.
         pub fn jsonStringify(b: Body, writer: anytype) !void {
-            switch (b) {
-                inline else => |body| try writer.write(body),
+            try writer.beginObject();
+
+            try writer.objectField("type");
+            try writer.write(@tagName(b.type));
+
+            if (b.msg_id) |id| {
+                try writer.objectField("msg_id");
+                try writer.write(id);
             }
+
+            if (b.in_reply_to) |id| {
+                try writer.objectField("in_reply_to");
+                try writer.write(id);
+            }
+
+            // Write the fields in `Extra`.
+            switch (b.extra) { // switch on the tag
+                inline else => |value| { // pull out the value
+                    const type_info = @typeInfo(@TypeOf(value));
+                    std.debug.assert(type_info == .@"struct");
+                    inline for (type_info.@"struct".fields) |field| {
+                        try writer.objectField(field.name);
+                        try writer.write(@field(value, field.name));
+                    }
+                },
+            }
+
+            try writer.endObject();
         }
     };
 };
 
 /// Serialise the value to JSON (with indentation) returning a slice. The caller is responsible for
-/// freeing the slice with `std.testing.allocator.free`.
+/// freeing the slice (e.g. with `std.testing.allocator.free(j)`).
 fn allocPrintJson(
     value: anytype,
 ) ![]const u8 {
@@ -370,6 +359,9 @@ fn allocPrintJson(
         .{std.json.fmt(value, .{ .whitespace = .indent_2 })},
     );
 }
+
+// These tests are really just documentation. They helped me get up to speed with serialisation and
+// deserialisation in `std.json`.
 
 test "tag values are serialised as strings" {
     const E = enum { a, b };
@@ -386,76 +378,33 @@ test "tag values are serialised as strings" {
 }
 
 test "stringified tagged unions nest value under tag" {
-    const Msg = struct {
-        src: []const u8,
-        dest: []const u8,
-        body: Body,
-
-        const Kind = enum { init, echo };
-
-        const Body = union(Kind) {
-            init: struct {
-                type: Kind = .init,
-                msg_id: usize,
-                node_id: []const u8,
-                node_ids: []const []const u8,
-            },
-            echo: struct {
-                type: Kind = .echo,
-                msg_id: usize,
-                echo: []const u8,
-            },
-        };
+    const Struct = struct {
+        const Enum = enum { tag };
+        const TaggedUnion = union(Enum) { tag: bool };
+        tagged_union: TaggedUnion,
     };
 
-    const m = Msg{
-        .src = "c1",
-        .dest = "n1",
-        .body = .{
-            .echo = .{
-                .type = .echo,
-                .msg_id = 1,
-                .echo = "Please echo 35",
-            },
-        },
-    };
-    const j = try allocPrintJson(m);
+    const s = Struct{ .tagged_union = .{ .tag = true } };
+
+    const j = try allocPrintJson(s);
     defer std.testing.allocator.free(j);
 
     try std.testing.expectEqualStrings(
         \\{
-        \\  "src": "c1",
-        \\  "dest": "n1",
-        \\  "body": {
-        \\    "echo": {
-        //    ^ This is the nesting we want to avoid.
-        \\      "type": "echo",
-        \\      "msg_id": 1,
-        \\      "echo": "Please echo 35"
-        \\    }
+        \\  "tagged_union": {
+        //  ^ This is the nesting we avoid using the JSON overloads in `Extra` and `Body` above.
+        \\    "tag": true
         \\  }
         \\}
     , j);
 }
 
-test "serialise" {
-    const m: Message = .{
-        .src = "c1",
-        .dest = "n1",
-        .body = .{
-            .init = .{
-                .type = .init,
-                .msg_id = 1,
-                .node_id = "n1",
-                .node_ids = &.{ "n1", "n2", "n3" },
-            },
-        },
-    };
-
-    const j = try allocPrintJson(m);
-    defer std.testing.allocator.free(j);
-
-    try std.testing.expectEqualStrings(
+// Sanity check JSON serialisation and deserialisation. Message `"body"`s contain different flags
+// depending on the specified `"type"`. A tagged union allows us to store different fields in
+// `Extra` depending on the tag (`"type"`) but it requires some `std.json` overload magic (found in
+// `Body` and `Extra`).
+test Message {
+    const j =
         \\{
         \\  "src": "c1",
         \\  "dest": "n1",
@@ -470,27 +419,12 @@ test "serialise" {
         \\    ]
         \\  }
         \\}
-    , j);
-}
+    ;
 
-test "deserialise" {
-    const parsed = try std.json.parseFromSlice(Message, std.testing.allocator,
-        \\{
-        \\  "src": "c1",
-        \\  "dest": "n1",
-        \\  "body": {
-        \\    "type": "echo",
-        \\    "msg_id": 1,
-        \\    "echo": "Please echo 35"
-        \\  }
-        \\}
-    , .{});
-    defer parsed.deinit();
-    const m = parsed.value;
+    const deserialised = try std.json.parseFromSlice(Message, std.testing.allocator, j, .{});
+    defer deserialised.deinit();
+    const serialised = try allocPrintJson(deserialised.value);
+    defer std.testing.allocator.free(serialised);
 
-    try std.testing.expectEqualStrings("c1", m.src);
-    try std.testing.expectEqualStrings("n1", m.dest);
-    try std.testing.expectEqual(.echo, m.body.echo.type);
-    try std.testing.expectEqual(1, m.body.echo.msg_id);
-    try std.testing.expectEqualStrings("Please echo 35", m.body.echo.echo);
+    try std.testing.expectEqualStrings(j, serialised);
 }
