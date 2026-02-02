@@ -42,20 +42,23 @@ fn logFn(
 }
 
 const Node = struct {
+    const msgs_received_max = 256;
+
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
 
     id: []const u8,
-    // peers: []const []const u8,
     /// Counter for IDs for messages sent from this node.
     msg_count: usize = 1,
-    msgs: std.ArrayList(isize) = .empty,
+    msgs_received: std.ArrayList(isize),
 
     fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
         const line = try reader.takeDelimiterInclusive('\n');
         const parsed = try std.json.parseFromSlice(Message, allocator, line, .{
-            // Maelstrom includes a top-level "id" field on init for some reason.
+            // FIXME: Maelstrom includes a top-level "id" field in client messages. Ignore for now.
+            // Later make it optional and default to null and make sure `ignore_unknown_fields` set
+            // to false wherever possible.
             .ignore_unknown_fields = true,
         });
         defer parsed.deinit();
@@ -73,23 +76,19 @@ const Node = struct {
         writer: *std.Io.Writer,
     ) !Node {
         const msg = try recv(allocator, reader);
-
-        std.log.debug("Received init msg. I am node {s}", .{msg.body.extra.init.node_id});
-        const other_nodes = try std.mem.join(allocator, ", ", msg.body.extra.init.node_ids);
-        defer allocator.free(other_nodes);
-        std.log.debug("Nodes in cluster: {s}", .{other_nodes});
+        const node_id = msg.body.extra.init.node_id;
 
         var n: Node = .{
             .allocator = allocator,
             .reader = reader,
             .writer = writer,
-            .id = try allocator.dupe(u8, msg.body.extra.init.node_id),
-            // .peers = try allocator.dupe(u8, msg.body.extra.init.node_ids),
+            .id = try allocator.dupe(u8, node_id),
+            .msgs_received = try .initCapacity(allocator, Node.msgs_received_max),
         };
 
         // Reply with init_ok ack.
         try n.send(.{
-            .src = msg.body.extra.init.node_id,
+            .src = n.id,
             .dest = msg.src,
             .body = .{
                 .type = .init_ok,
@@ -98,13 +97,14 @@ const Node = struct {
             },
         });
 
+        std.log.debug("Node {s} initialised", .{node_id});
+
         return n;
     }
 
     pub fn deinit(n: *Node) void {
         n.allocator.free(n.id);
-        defer n.msgs.deinit(n.allocator);
-        // n.allocator.free(n.peers);
+        defer n.msgs_received.deinit(n.allocator);
     }
 
     pub fn tick(n: *Node) !void {
@@ -164,7 +164,7 @@ const Node = struct {
                     .type = .read_ok,
                     .msg_id = n.msg_id(),
                     .in_reply_to = msg.body.msg_id,
-                    .extra = .{ .read_ok = .{ .messages = n.msgs.items } },
+                    .extra = .{ .read_ok = .{ .messages = n.msgs_received.items } },
                 },
             }),
             .init => @panic("Received second init message"),
@@ -190,8 +190,8 @@ const Node = struct {
 };
 
 const Message = struct {
-    src: []const u8,
-    dest: []const u8,
+    src: []const u8, // e.g. "c1"
+    dest: []const u8, // e.g. "n2"
     body: Body,
 
     /// The message type. We're calling it `Kind` because `type` is a Zig keyword. These *must*
