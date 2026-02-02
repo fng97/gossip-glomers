@@ -111,62 +111,17 @@ const Node = struct {
         const msg = try recv(n.allocator, n.reader);
 
         switch (msg.body.extra) {
-            .echo => |e| try n.send(.{
-                .src = n.id,
-                .dest = msg.src,
-                .body = .{
-                    .type = .echo_ok,
-                    .msg_id = n.msg_id(),
-                    .in_reply_to = msg.body.msg_id,
-                    .extra = .{ .echo_ok = .{ .echo = e.echo } },
-                },
-            }),
-            .generate => try n.send(.{
-                .src = n.id,
-                .dest = msg.src,
-                .body = .{
-                    .type = .generate_ok,
-                    .msg_id = n.msg_id(),
-                    .in_reply_to = msg.body.msg_id,
-                    .extra = .{ .generate_ok = .{ .id = new_id() } },
-                },
-            }),
+            .echo => |e| try n.reply(msg, .{ .echo_ok = .{ .echo = e.echo } }),
+            .generate => try n.reply(msg, .{ .generate_ok = .{ .id = new_id() } }),
             .broadcast => |b| {
                 for (n.msgs_received.items) |m| {
-                    if (b.message == m) break;
+                    if (b.message == m) break; // we already have this message
                 } else n.msgs_received.appendAssumeCapacity(b.message);
-                try n.send(.{
-                    .src = n.id,
-                    .dest = msg.src,
-                    .body = .{
-                        .type = .broadcast_ok,
-                        .msg_id = n.msg_id(),
-                        .in_reply_to = msg.body.msg_id,
-                        .extra = .{ .broadcast_ok = .{} },
-                    },
-                });
+                try n.reply(msg, .{ .broadcast_ok = .{} });
             },
-            .topology => try n.send(.{
-                .src = n.id,
-                .dest = msg.src,
-                .body = .{
-                    // TODO: Store topology? Don't we get this at the start?
-                    .type = .topology_ok,
-                    .msg_id = n.msg_id(),
-                    .in_reply_to = msg.body.msg_id,
-                    .extra = .{ .topology_ok = .{} },
-                },
-            }),
-            .read => try n.send(.{
-                .src = n.id,
-                .dest = msg.src,
-                .body = .{
-                    .type = .read_ok,
-                    .msg_id = n.msg_id(),
-                    .in_reply_to = msg.body.msg_id,
-                    .extra = .{ .read_ok = .{ .messages = n.msgs_received.items } },
-                },
-            }),
+            // TODO: Store topology.
+            .topology => try n.reply(msg, .{ .topology_ok = .{} }),
+            .read => try n.reply(msg, .{ .read_ok = .{ .messages = n.msgs_received.items } }),
             .init => @panic("Received second init message"),
             .echo_ok,
             .init_ok,
@@ -186,6 +141,19 @@ const Node = struct {
 
     fn new_id() usize {
         return std.crypto.random.int(usize);
+    }
+
+    fn reply(node: *Node, message: Message, extra: Message.Body.Extra) !void {
+        try node.send(.{
+            .src = node.id,
+            .dest = message.src,
+            .body = .{
+                .type = std.meta.activeTag(extra),
+                .msg_id = node.msg_id(),
+                .in_reply_to = message.body.msg_id,
+                .extra = extra,
+            },
+        });
     }
 };
 
