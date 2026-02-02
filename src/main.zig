@@ -55,12 +55,15 @@ const Node = struct {
 
     fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
         const line = try reader.takeDelimiterInclusive('\n');
-        const parsed = try std.json.parseFromSlice(Message, allocator, line, .{
+        const parsed = std.json.parseFromSlice(Message, allocator, line, .{
             // FIXME: Maelstrom includes a top-level "id" field in client messages. Ignore for now.
             // Later make it optional and default to null and make sure `ignore_unknown_fields` set
             // to false wherever possible.
             .ignore_unknown_fields = true,
-        });
+        }) catch |e| {
+            std.log.err("Failed to parse message: {s}", .{line});
+            return e;
+        };
         defer parsed.deinit();
         return parsed.value;
     }
