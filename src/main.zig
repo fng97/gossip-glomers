@@ -132,7 +132,9 @@ const Node = struct {
                 },
             }),
             .broadcast => |b| {
-                try n.msgs.append(n.allocator, b.message);
+                for (n.msgs_received.items) |m| {
+                    if (b.message == m) break;
+                } else n.msgs_received.appendAssumeCapacity(b.message);
                 try n.send(.{
                     .src = n.id,
                     .dest = msg.src,
