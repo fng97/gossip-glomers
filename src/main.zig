@@ -218,11 +218,13 @@ const Message = struct {
             },
             topology_ok: struct {},
 
-            // FIXME: Fix these docs.
-            /// Define the parsing of this tagged union. The default parsinge expects the object to
-            /// be nested under the tag but the extra fields exist in the parent object. The parent
-            /// Body struct will parse common fields (type, msg_id, in_reply_to) using defaults, and
-            /// we handle the tag-specific fields here based on the "type" field.
+            /// Override JSON parsing to account for tagged union nesting.
+            ///
+            /// By default, Zig's JSON parser expects a tagged union to be represented as a nested
+            /// object like `{"tag_name": {...}}`. However, in our message format the union's fields
+            /// exist at the top level (within the `"body"` object). We get around this by manually
+            /// checking the `"type"` field (i.e. our union's tag) then using the default parsing
+            /// for the corresponding type.
             pub fn jsonParseFromValue(
                 allocator: std.mem.Allocator,
                 value: std.json.Value,
@@ -244,18 +246,26 @@ const Message = struct {
                 return error.UnknownField;
             }
 
-            /// Define serialisation for the same reasons deserialisation was defined above. Instead
-            /// of nesting this tagged union's value in a tag key (the default), write the value
-            /// directly.
-            pub fn jsonStringify(e: Extra, writer: anytype) !void {
-                switch (e) {
-                    inline else => |extra| try writer.write(extra),
+            /// Override serialisation for the same reasons parsing was overridden above. The
+            /// default nests the union value under the tag. Instead, just serialise the value with
+            /// default serialisation.
+            pub fn jsonStringify(extra: Extra, writer: anytype) !void {
+                // Switch on the tag to get the value and serialise that instead of the whole union.
+                switch (extra) {
+                    inline else => |value| try writer.write(value),
                 }
             }
         };
 
-        /// Define custom parsing to handle flattened structure. The JSON has all fields
-        /// at the same level, so we parse common fields and delegate extra fields to Extra.
+        /// Override parsing to handle flattened structure. We nest the `Extra` tagged union in
+        /// `Body` to store different fields depending on the `Kind`. However, the JSON message
+        /// format has all fields at the same level under `"body"`. We do the following to get
+        /// around this:
+        ///
+        /// 1. Parse the common fields (type, msg_id, in_reply_to) manually.
+        /// 2. Use the "type" field to determine which `Extra` union variant to parse.
+        /// 3. Re-parse the whole `"body"` value as the union variant type using default parsing,
+        ///    ignoring unknown fields to skip the common fields we parsed manually.
         pub fn jsonParse(
             allocator: std.mem.Allocator,
             source: anytype,
