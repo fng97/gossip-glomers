@@ -173,8 +173,8 @@ const Message = struct {
 
     const Body = struct {
         type: Kind,
-        msg_id: ?usize = null,
         in_reply_to: ?usize = null,
+        msg_id: usize,
         extra: Extra,
 
         const Extra = union(Kind) {
@@ -268,7 +268,7 @@ const Message = struct {
             // Extract common fields
             const kind_str = obj.get("type").?.string;
             const kind = std.meta.stringToEnum(Kind, kind_str) orelse return error.UnknownField;
-            const msg_id = if (obj.get("msg_id")) |v| @as(usize, @intCast(v.integer)) else null;
+            const msg_id = @as(usize, @intCast(obj.get("msg_id").?.integer));
             const in_reply_to =
                 if (obj.get("in_reply_to")) |v| @as(usize, @intCast(v.integer)) else null;
 
@@ -295,10 +295,8 @@ const Message = struct {
             try writer.objectField("type");
             try writer.write(@tagName(body.type));
 
-            if (body.msg_id) |id| {
-                try writer.objectField("msg_id");
-                try writer.write(id);
-            }
+            try writer.objectField("msg_id");
+            try writer.write(body.msg_id);
 
             if (body.in_reply_to) |id| {
                 try writer.objectField("in_reply_to");
