@@ -42,7 +42,7 @@ fn logFn(
 }
 
 const Node = struct {
-    const msgs_received_max = 256;
+    const messages_received_max = 256;
 
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -50,8 +50,8 @@ const Node = struct {
 
     id: []const u8,
     /// Counter for IDs for messages sent from this node.
-    msg_count: usize = 1,
-    msgs_received: std.ArrayList(isize),
+    messages_sent_count: usize = 1,
+    messages_received: std.ArrayList(isize),
 
     fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
         const line = try reader.takeDelimiterInclusive('\n');
@@ -68,8 +68,8 @@ const Node = struct {
         return parsed.value;
     }
 
-    fn send(n: *Node, msg: Message) !void {
-        try n.writer.print("{f}\n", .{std.json.fmt(msg, .{})});
+    fn send(node: *Node, message: Message) !void {
+        try node.writer.print("{f}\n", .{std.json.fmt(message, .{})});
     }
 
     /// Read initialisation message, set node ID, and respond with `init_ok`.
@@ -78,53 +78,44 @@ const Node = struct {
         reader: *std.Io.Reader,
         writer: *std.Io.Writer,
     ) !Node {
-        const msg = try recv(allocator, reader);
-        const node_id = msg.body.extra.init.node_id;
+        const message = try recv(allocator, reader);
 
-        var n: Node = .{
+        var node: Node = .{
             .allocator = allocator,
             .reader = reader,
             .writer = writer,
-            .id = try allocator.dupe(u8, node_id),
-            .msgs_received = try .initCapacity(allocator, Node.msgs_received_max),
+            .id = try allocator.dupe(u8, message.body.extra.init.node_id),
+            .messages_received = try .initCapacity(allocator, Node.messages_received_max),
         };
 
-        // Reply with init_ok ack.
-        try n.send(.{
-            .src = n.id,
-            .dest = msg.src,
-            .body = .{
-                .type = .init_ok,
-                .in_reply_to = msg.body.msg_id,
-                .extra = .{ .init_ok = .{} },
-            },
-        });
+        try node.reply(message, .{ .init_ok = .{} });
+        std.log.debug("Node {s} initialised", .{node.id});
 
-        std.log.debug("Node {s} initialised", .{node_id});
-
-        return n;
+        return node;
     }
 
-    pub fn deinit(n: *Node) void {
-        n.allocator.free(n.id);
-        defer n.msgs_received.deinit(n.allocator);
+    pub fn deinit(node: *Node) void {
+        node.allocator.free(node.id);
+        defer node.messages_received.deinit(node.allocator);
     }
 
-    pub fn tick(n: *Node) !void {
-        const msg = try recv(n.allocator, n.reader);
+    pub fn tick(node: *Node) !void {
+        const message = try recv(node.allocator, node.reader);
 
-        switch (msg.body.extra) {
-            .echo => |e| try n.reply(msg, .{ .echo_ok = .{ .echo = e.echo } }),
-            .generate => try n.reply(msg, .{ .generate_ok = .{ .id = new_id() } }),
+        switch (message.body.extra) {
+            .echo => |e| try node.reply(message, .{ .echo_ok = .{ .echo = e.echo } }),
+            .generate => try node.reply(message, .{ .generate_ok = .{ .id = new_id() } }),
             .broadcast => |b| {
-                for (n.msgs_received.items) |m| {
+                for (node.messages_received.items) |m| {
                     if (b.message == m) break; // we already have this message
-                } else n.msgs_received.appendAssumeCapacity(b.message);
-                try n.reply(msg, .{ .broadcast_ok = .{} });
+                } else node.messages_received.appendAssumeCapacity(b.message);
+                try node.reply(message, .{ .broadcast_ok = .{} });
             },
             // TODO: Store topology.
-            .topology => try n.reply(msg, .{ .topology_ok = .{} }),
-            .read => try n.reply(msg, .{ .read_ok = .{ .messages = n.msgs_received.items } }),
+            .topology => try node.reply(message, .{ .topology_ok = .{} }),
+            .read => try node.reply(message, .{
+                .read_ok = .{ .messages = node.messages_received.items },
+            }),
             .init => @panic("Received second init message"),
             .echo_ok,
             .init_ok,
@@ -132,13 +123,13 @@ const Node = struct {
             .broadcast_ok,
             .read_ok,
             .topology_ok,
-            => std.debug.panic("Received unexpected message: {s}", .{@tagName(msg.body.extra)}),
+            => std.debug.panic("Received unexpected message: {s}", .{@tagName(message.body.extra)}),
         }
     }
 
-    fn msg_id(n: *Node) usize {
-        const id = n.msg_count;
-        n.msg_count += 1;
+    fn message_id(node: *Node) usize {
+        const id = node.messages_sent_count;
+        node.messages_sent_count += 1;
         return id;
     }
 
@@ -152,7 +143,7 @@ const Node = struct {
             .dest = message.src,
             .body = .{
                 .type = std.meta.activeTag(extra),
-                .msg_id = node.msg_id(),
+                .msg_id = node.message_id(),
                 .in_reply_to = message.body.msg_id,
                 .extra = extra,
             },
@@ -213,7 +204,6 @@ const Message = struct {
                 messages: []isize,
             },
             topology: struct {
-                // TODO: Use tags for node/client ids? Ignore for now.
                 // topology: []struct {},
             },
             topology_ok: struct {},
@@ -279,9 +269,10 @@ const Message = struct {
             const kind_str = obj.get("type").?.string;
             const kind = std.meta.stringToEnum(Kind, kind_str) orelse return error.UnknownField;
             const msg_id = if (obj.get("msg_id")) |v| @as(usize, @intCast(v.integer)) else null;
-            const in_reply_to = if (obj.get("in_reply_to")) |v| @as(usize, @intCast(v.integer)) else null;
+            const in_reply_to =
+                if (obj.get("in_reply_to")) |v| @as(usize, @intCast(v.integer)) else null;
 
-            // Parse extra fields using the entire value (Extra.jsonParse will extract what it needs)
+            // Parse extra fields using the entire `"body"` value, ignoring already parsed fields.
             var o = options;
             o.ignore_unknown_fields = true;
             const extra = try std.json.innerParseFromValue(Extra, allocator, value, o);
@@ -298,24 +289,24 @@ const Message = struct {
         /// parent. We write the common fields (type, msg_id, in_reply_to) first. We then write
         /// `Extra`'s fields if they exist. `init_ok`, for example, doesn't have any `Extra` fields
         /// so only the common fields are serialised.
-        pub fn jsonStringify(b: Body, writer: anytype) !void {
+        pub fn jsonStringify(body: Body, writer: anytype) !void {
             try writer.beginObject();
 
             try writer.objectField("type");
-            try writer.write(@tagName(b.type));
+            try writer.write(@tagName(body.type));
 
-            if (b.msg_id) |id| {
+            if (body.msg_id) |id| {
                 try writer.objectField("msg_id");
                 try writer.write(id);
             }
 
-            if (b.in_reply_to) |id| {
+            if (body.in_reply_to) |id| {
                 try writer.objectField("in_reply_to");
                 try writer.write(id);
             }
 
             // Write the fields in `Extra`.
-            switch (b.extra) { // switch on the tag
+            switch (body.extra) { // switch on the tag
                 inline else => |value| { // pull out the value
                     const type_info = @typeInfo(@TypeOf(value));
                     std.debug.assert(type_info == .@"struct");
