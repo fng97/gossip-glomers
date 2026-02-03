@@ -55,12 +55,7 @@ const Node = struct {
 
     fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
         const line = try reader.takeDelimiterInclusive('\n');
-        const parsed = std.json.parseFromSlice(Message, allocator, line, .{
-            // FIXME: Maelstrom includes a top-level "id" field in client messages. Ignore for now.
-            // Later make it optional and default to null and make sure `ignore_unknown_fields` set
-            // to false wherever possible.
-            .ignore_unknown_fields = true,
-        }) catch |e| {
+        const parsed = std.json.parseFromSlice(Message, allocator, line, .{}) catch |e| {
             std.log.err("Failed to parse message: {s}", .{line});
             return e;
         };
@@ -69,7 +64,9 @@ const Node = struct {
     }
 
     fn send(node: *Node, message: Message) !void {
-        try node.writer.print("{f}\n", .{std.json.fmt(message, .{})});
+        try node.writer.print("{f}\n", .{
+            std.json.fmt(message, .{ .emit_null_optional_fields = false }),
+        });
     }
 
     /// Read initialisation message, set node ID, and respond with `init_ok`.
@@ -152,6 +149,7 @@ const Node = struct {
 };
 
 const Message = struct {
+    id: ?usize = null, // maelstrom includes a top-level "id" field in client messages
     src: []const u8, // e.g. "c1"
     dest: []const u8, // e.g. "n2"
     body: Body,
@@ -222,8 +220,10 @@ const Message = struct {
             ) !Extra {
                 const kind = value.object.get("type").?.string;
 
-                // If a field in the union matches the "type" of this object, parse the object as
-                // the type that `kind` corresponds to.
+                // Toggle `ignore_unknown_fields` back to false. See `Body.jsonParse`.
+                var o = options;
+                o.ignore_unknown_fields = false;
+                // Parse the object to the type that `kind` corresponds to.
                 const type_info = @typeInfo(Extra).@"union";
                 inline for (type_info.fields) |field| if (std.mem.eql(u8, field.name, kind)) {
                     return @unionInit(
@@ -330,7 +330,7 @@ fn allocPrintJson(
     return try std.fmt.allocPrint(
         std.testing.allocator,
         "{f}",
-        .{std.json.fmt(value, .{ .whitespace = .indent_2 })},
+        .{std.json.fmt(value, .{ .whitespace = .indent_2, .emit_null_optional_fields = false })},
     );
 }
 
