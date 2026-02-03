@@ -173,8 +173,8 @@ const Message = struct {
 
     const Body = struct {
         type: Kind,
-        in_reply_to: ?usize = null,
         msg_id: usize,
+        in_reply_to: ?usize, // only present in replies
         extra: Extra,
 
         const Extra = union(Kind) {
