@@ -220,9 +220,11 @@ const Message = struct {
             ) !Extra {
                 const kind = value.object.get("type").?.string;
 
-                // Toggle `ignore_unknown_fields` back to false. See `Body.jsonParse`.
-                var o = options;
-                o.ignore_unknown_fields = false;
+                // FIXME: Figure out how to parse messages without ever enabling this option.
+                // // Toggle `ignore_unknown_fields` back to false. See `Body.jsonParse`.
+                // var o = options;
+                // o.ignore_unknown_fields = false;
+
                 // Parse the object to the type that `kind` corresponds to.
                 const type_info = @typeInfo(Extra).@"union";
                 inline for (type_info.fields) |field| if (std.mem.eql(u8, field.name, kind)) {
