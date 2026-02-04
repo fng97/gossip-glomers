@@ -42,17 +42,17 @@ fn logFn(
 }
 
 const Node = struct {
-    const messages_received_max = 256;
+    const broadcasts_received_max = 256;
 
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
     writer: *std.Io.Writer,
 
     id: []const u8,
-    /// Counter for IDs for messages sent from this node.
-    messages_sent_count: usize = 1,
-    messages_received: std.ArrayList(isize),
-    topology: std.ArrayList([]const u8) = .empty,
+    /// Message ID counter. Message IDs are unique (to the node). Just use a counter.
+    next_message_id: usize = 1,
+    broadcasts_received: std.ArrayList(isize),
+    broadcasts_topology: std.ArrayList([]const u8) = .empty,
 
     /// Read and parse the next message (newline-separated). The caller is responsible for calling
     /// `deinit()` on the returned value.
@@ -87,7 +87,7 @@ const Node = struct {
             .reader = reader,
             .writer = writer,
             .id = try allocator.dupe(u8, m.body.extra.init.node_id),
-            .messages_received = try .initCapacity(allocator, Node.messages_received_max),
+            .broadcasts_received = try .initCapacity(allocator, Node.broadcasts_received_max),
         };
 
         try node.reply(m, .{ .init_ok = .{} });
@@ -98,7 +98,7 @@ const Node = struct {
 
     pub fn deinit(node: *Node) void {
         node.allocator.free(node.id);
-        defer node.messages_received.deinit(node.allocator);
+        defer node.broadcasts_received.deinit(node.allocator);
     }
 
     pub fn tick(node: *Node) !void {
@@ -110,13 +110,13 @@ const Node = struct {
             .echo => |e| try node.reply(m, .{ .echo_ok = .{ .echo = e.echo } }),
             .generate => try node.reply(m, .{ .generate_ok = .{ .id = new_id() } }),
             .broadcast => |b| {
-                for (node.messages_received.items) |received_message| {
+                for (node.broadcasts_received.items) |received_message| {
                     if (b.message == received_message) break; // we already have this message
                 } else {
                     // Store message.
-                    node.messages_received.appendAssumeCapacity(b.message);
+                    node.broadcasts_received.appendAssumeCapacity(b.message);
                     // Send message to peer nodes according to topology.
-                    for (node.topology.items) |node_id| try node.send(.{
+                    for (node.broadcasts_topology.items) |node_id| try node.send(.{
                         .src = node.id,
                         .dest = try node.allocator.dupe(u8, node_id),
                         .body = .{
@@ -137,12 +137,12 @@ const Node = struct {
             .broadcast_ok => {}, // acks from peers
             .topology => |t| {
                 // TODO: Assert topology is empty (i.e. it must only be set once).
-                try node.topology.appendSlice(node.allocator, t.topology.map.get(node.id).?);
+                try node.broadcasts_topology.appendSlice(node.allocator, t.topology.map.get(node.id).?);
                 try node.reply(m, .{ .topology_ok = .{} });
             },
             // Reply with all received messages.
             .read => try node.reply(m, .{
-                .read_ok = .{ .messages = node.messages_received.items },
+                .read_ok = .{ .messages = node.broadcasts_received.items },
             }),
             .init => @panic("Received second init message"),
             .echo_ok,
@@ -155,8 +155,8 @@ const Node = struct {
     }
 
     fn message_id(node: *Node) usize {
-        const id = node.messages_sent_count;
-        node.messages_sent_count += 1;
+        const id = node.next_message_id;
+        node.next_message_id += 1;
         return id;
     }
 
