@@ -54,16 +54,16 @@ const Node = struct {
     messages_received: std.ArrayList(isize),
     topology: std.ArrayList([]const u8) = .empty,
 
-    fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
+    /// Read and parse the next message (newline-separated). The caller is responsible for calling
+    /// `deinit()` on the returned value.
+    fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !std.json.Parsed(Message) {
         const line = try reader.takeDelimiterInclusive('\n');
         const parsed = std.json.parseFromSlice(Message, allocator, line, .{}) catch |e| {
             std.log.err("Failed to parse message: {s}", .{line});
             return e;
         };
 
-        // FIXME: This should be done by the caller!! Only working (somewhat) because we're using an arena.
-        defer parsed.deinit();
-        return parsed.value;
+        return parsed;
     }
 
     fn send(node: *Node, message: Message) !void {
@@ -79,16 +79,18 @@ const Node = struct {
         writer: *std.Io.Writer,
     ) !Node {
         const message = try recv(allocator, reader);
+        defer message.deinit();
+        const m = message.value;
 
         var node: Node = .{
             .allocator = allocator,
             .reader = reader,
             .writer = writer,
-            .id = try allocator.dupe(u8, message.body.extra.init.node_id),
+            .id = try allocator.dupe(u8, m.body.extra.init.node_id),
             .messages_received = try .initCapacity(allocator, Node.messages_received_max),
         };
 
-        try node.reply(message, .{ .init_ok = .{} });
+        try node.reply(m, .{ .init_ok = .{} });
         std.log.debug("Node {s} initialised", .{node.id});
 
         return node;
@@ -101,13 +103,15 @@ const Node = struct {
 
     pub fn tick(node: *Node) !void {
         const message = try recv(node.allocator, node.reader);
+        defer message.deinit();
+        const m = message.value;
 
-        switch (message.body.extra) {
-            .echo => |e| try node.reply(message, .{ .echo_ok = .{ .echo = e.echo } }),
-            .generate => try node.reply(message, .{ .generate_ok = .{ .id = new_id() } }),
+        switch (m.body.extra) {
+            .echo => |e| try node.reply(m, .{ .echo_ok = .{ .echo = e.echo } }),
+            .generate => try node.reply(m, .{ .generate_ok = .{ .id = new_id() } }),
             .broadcast => |b| {
-                for (node.messages_received.items) |m| {
-                    if (b.message == m) break; // we already have this message
+                for (node.messages_received.items) |received_message| {
+                    if (b.message == received_message) break; // we already have this message
                 } else {
                     // Store message.
                     node.messages_received.appendAssumeCapacity(b.message);
@@ -128,16 +132,16 @@ const Node = struct {
                     });
                 }
 
-                try node.reply(message, .{ .broadcast_ok = .{} });
+                try node.reply(m, .{ .broadcast_ok = .{} });
             },
             .broadcast_ok => {}, // acks from peers
             .topology => |t| {
                 // TODO: Assert topology is empty (i.e. it must only be set once).
                 try node.topology.appendSlice(node.allocator, t.topology.map.get(node.id).?);
-                try node.reply(message, .{ .topology_ok = .{} });
+                try node.reply(m, .{ .topology_ok = .{} });
             },
             // Reply with all received messages.
-            .read => try node.reply(message, .{
+            .read => try node.reply(m, .{
                 .read_ok = .{ .messages = node.messages_received.items },
             }),
             .init => @panic("Received second init message"),
@@ -146,7 +150,7 @@ const Node = struct {
             .generate_ok,
             .read_ok,
             .topology_ok,
-            => std.debug.panic("Received unexpected message: {s}", .{@tagName(message.body.extra)}),
+            => std.debug.panic("Received unexpected message: {s}", .{@tagName(m.body.extra)}),
         }
     }
 
