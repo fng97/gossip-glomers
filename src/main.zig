@@ -52,6 +52,7 @@ const Node = struct {
     /// Counter for IDs for messages sent from this node.
     messages_sent_count: usize = 1,
     messages_received: std.ArrayList(isize),
+    topology: std.ArrayList([]const u8) = .empty,
 
     fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !Message {
         const line = try reader.takeDelimiterInclusive('\n');
@@ -59,6 +60,8 @@ const Node = struct {
             std.log.err("Failed to parse message: {s}", .{line});
             return e;
         };
+
+        // FIXME: This should be done by the caller!! Only working (somewhat) because we're using an arena.
         defer parsed.deinit();
         return parsed.value;
     }
@@ -105,11 +108,35 @@ const Node = struct {
             .broadcast => |b| {
                 for (node.messages_received.items) |m| {
                     if (b.message == m) break; // we already have this message
-                } else node.messages_received.appendAssumeCapacity(b.message);
+                } else {
+                    // Store message.
+                    node.messages_received.appendAssumeCapacity(b.message);
+                    // Send message to peer nodes according to topology.
+                    for (node.topology.items) |node_id| try node.send(.{
+                        .src = node.id,
+                        .dest = try node.allocator.dupe(u8, node_id),
+                        .body = .{
+                            .type = .broadcast,
+                            .msg_id = node.message_id(),
+                            .in_reply_to = null,
+                            .extra = .{
+                                .broadcast = .{
+                                    .message = b.message,
+                                },
+                            },
+                        },
+                    });
+                }
+
                 try node.reply(message, .{ .broadcast_ok = .{} });
             },
-            // TODO: Store topology.
-            .topology => try node.reply(message, .{ .topology_ok = .{} }),
+            .broadcast_ok => {}, // acks from peers
+            .topology => |t| {
+                // TODO: Assert topology is empty (i.e. it must only be set once).
+                try node.topology.appendSlice(node.allocator, t.topology.map.get(node.id).?);
+                try node.reply(message, .{ .topology_ok = .{} });
+            },
+            // Reply with all received messages.
             .read => try node.reply(message, .{
                 .read_ok = .{ .messages = node.messages_received.items },
             }),
@@ -117,7 +144,6 @@ const Node = struct {
             .echo_ok,
             .init_ok,
             .generate_ok,
-            .broadcast_ok,
             .read_ok,
             .topology_ok,
             => std.debug.panic("Received unexpected message: {s}", .{@tagName(message.body.extra)}),
@@ -202,7 +228,7 @@ const Message = struct {
                 messages: []isize,
             },
             topology: struct {
-                // topology: []struct {},
+                topology: std.json.ArrayHashMap([]const []const u8),
             },
             topology_ok: struct {},
 

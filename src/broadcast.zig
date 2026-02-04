@@ -6,7 +6,7 @@ test "broadcast workload" {
         "maelstrom",                 "test",
         "--workload",                "broadcast",
         "--rate",                    "100",
-        "--node-count",              "1",
+        "--node-count",              "5",
         "--time-limit",              "3",
         "--bin=" ++ config.exe_path,
     }, std.testing.allocator);
