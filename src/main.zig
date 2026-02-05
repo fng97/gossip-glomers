@@ -10,20 +10,32 @@ pub fn main() !void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // Input JSON messages arrive newline-delimited via STDIN.
     var stdin_buffer: [1024]u8 = undefined;
     var stdin_reader = std.fs.File.stdin().reader(&stdin_buffer);
     const stdin = &stdin_reader.interface;
 
     // TODO: Use a buffered writer. When do you flush? End of tick?
+    // Output messages are sent newline-delimited to STDOUT.
     var stdout_writer = std.fs.File.stdout().writer(&.{});
     const stdout = &stdout_writer.interface;
 
-    var node: Node = try .init(arena, stdin, stdout);
+    // First message received is init.
+    const init_line = try stdin.takeDelimiterInclusive('\n');
+    var node: Node = try .init(arena, init_line, stdout);
     defer node.deinit();
 
-    while (true) try node.tick();
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = std.fs.File.stdin().handle,
+        .events = std.posix.POLL.IN,
+        .revents = 0,
+    }};
 
-    @panic("Exited event loop");
+    while (true) {
+        const ready = try std.posix.poll(&poll_fds, 200);
+        const line = if (ready > 0) stdin.takeDelimiterInclusive('\n') catch null else null;
+        try node.tick(line);
+    }
 }
 
 // Messages are sent and received from stdout and stdin respectively. Logs go to stderr so override
@@ -43,9 +55,9 @@ fn logFn(
 
 const Node = struct {
     const broadcasts_received_max = 256;
+    const broadcasts_retry_timeout = 200 * std.time.ns_per_ms;
 
     allocator: std.mem.Allocator,
-    reader: *std.Io.Reader,
     writer: *std.Io.Writer,
 
     id: []const u8,
@@ -53,18 +65,11 @@ const Node = struct {
     next_message_id: usize = 1,
     broadcasts_received: std.ArrayList(isize),
     broadcasts_topology: std.ArrayList([]const u8) = .empty,
-
-    /// Read and parse the next message (newline-separated). The caller is responsible for calling
-    /// `deinit()` on the returned value.
-    fn recv(allocator: std.mem.Allocator, reader: *std.Io.Reader) !std.json.Parsed(Message) {
-        const line = try reader.takeDelimiterInclusive('\n');
-        const parsed = std.json.parseFromSlice(Message, allocator, line, .{}) catch |e| {
-            std.log.err("Failed to parse message: {s}", .{line});
-            return e;
-        };
-
-        return parsed;
-    }
+    broadcasts_pending: std.AutoHashMap(usize, struct {
+        dest: []const u8,
+        message: isize,
+        time_sent: ?std.time.Instant = null,
+    }),
 
     fn send(node: *Node, message: Message) !void {
         try node.writer.print("{f}\n", .{
@@ -72,22 +77,22 @@ const Node = struct {
         });
     }
 
-    /// Read initialisation message, set node ID, and respond with `init_ok`.
+    /// Parse the init message, set node ID, and respond with `init_ok`.
     pub fn init(
         allocator: std.mem.Allocator,
-        reader: *std.Io.Reader,
+        init_line: []const u8,
         writer: *std.Io.Writer,
     ) !Node {
-        const message = try recv(allocator, reader);
+        const message = try std.json.parseFromSlice(Message, allocator, init_line, .{});
         defer message.deinit();
         const m = message.value;
 
         var node: Node = .{
             .allocator = allocator,
-            .reader = reader,
             .writer = writer,
             .id = try allocator.dupe(u8, m.body.extra.init.node_id),
             .broadcasts_received = try .initCapacity(allocator, Node.broadcasts_received_max),
+            .broadcasts_pending = .init(allocator),
         };
 
         try node.reply(m, .{ .init_ok = .{} });
@@ -101,56 +106,82 @@ const Node = struct {
         defer node.broadcasts_received.deinit(node.allocator);
     }
 
-    pub fn tick(node: *Node) !void {
-        const message = try recv(node.allocator, node.reader);
-        defer message.deinit();
-        const m = message.value;
+    pub fn tick(node: *Node, line: ?[]const u8) !void {
+        if (line) |l| {
+            const message = try std.json.parseFromSlice(Message, node.allocator, l, .{});
+            defer message.deinit();
+            const m = message.value;
 
-        switch (m.body.extra) {
-            .echo => |e| try node.reply(m, .{ .echo_ok = .{ .echo = e.echo } }),
-            .generate => try node.reply(m, .{ .generate_ok = .{ .id = new_id() } }),
-            .broadcast => |b| {
-                for (node.broadcasts_received.items) |received_message| {
-                    if (b.message == received_message) break; // we already have this message
-                } else {
-                    // Store message.
-                    node.broadcasts_received.appendAssumeCapacity(b.message);
-                    // Send message to peer nodes according to topology.
-                    for (node.broadcasts_topology.items) |node_id| try node.send(.{
-                        .src = node.id,
-                        .dest = try node.allocator.dupe(u8, node_id),
-                        .body = .{
-                            .type = .broadcast,
-                            .msg_id = node.message_id(),
-                            .in_reply_to = null,
-                            .extra = .{
-                                .broadcast = .{
-                                    .message = b.message,
-                                },
-                            },
+            switch (m.body.extra) {
+                .echo => |e| try node.reply(m, .{ .echo_ok = .{ .echo = e.echo } }),
+                .generate => try node.reply(m, .{ .generate_ok = .{ .id = new_id() } }),
+                .broadcast => |b| {
+                    for (node.broadcasts_received.items) |received_message| {
+                        if (b.message == received_message) break;
+                    } else {
+                        node.broadcasts_received.appendAssumeCapacity(b.message);
+                        for (node.broadcasts_topology.items) |node_id| {
+                            try node.broadcasts_pending.put(node.message_id(), .{
+                                .dest = try node.allocator.dupe(u8, node_id),
+                                .message = b.message,
+                            });
+                        }
+                    }
+
+                    try node.reply(m, .{ .broadcast_ok = .{} });
+                },
+                .broadcast_ok => {
+                    _ = node.broadcasts_pending.remove(m.body.in_reply_to.?);
+                },
+                .topology => |t| {
+                    // TODO: Assert topology is only set once.
+                    const peers = t.topology.map.get(node.id).?;
+                    try node.broadcasts_topology.appendSlice(node.allocator, peers);
+                    try node.reply(m, .{ .topology_ok = .{} });
+                },
+                .read => try node.reply(m, .{
+                    .read_ok = .{ .messages = node.broadcasts_received.items },
+                }),
+                .init => @panic("Received second init message"),
+                .echo_ok,
+                .init_ok,
+                .generate_ok,
+                .read_ok,
+                .topology_ok,
+                => std.debug.panic(
+                    "Received unexpected message: {s}",
+                    .{@tagName(m.body.extra)},
+                ),
+            }
+        }
+
+        var broadcasts_pending_itr = node.broadcasts_pending.iterator();
+        broadcast: while (broadcasts_pending_itr.next()) |b| {
+            const broadcast_message_id = b.key_ptr.*;
+            const broadcast = b.value_ptr;
+
+            const now = try std.time.Instant.now();
+            if (broadcast.time_sent) |time_sent| {
+                // Wait between rebroadcasts. If not timed out, check next broadcast message.
+                if (now.since(time_sent) < Node.broadcasts_retry_timeout) continue :broadcast;
+            }
+            // Record send time on first send and reset on retry.
+            broadcast.time_sent = now;
+
+            try node.send(.{
+                .src = node.id,
+                .dest = broadcast.dest,
+                .body = .{
+                    .type = .broadcast,
+                    .msg_id = broadcast_message_id,
+                    .in_reply_to = null,
+                    .extra = .{
+                        .broadcast = .{
+                            .message = broadcast.message,
                         },
-                    });
-                }
-
-                try node.reply(m, .{ .broadcast_ok = .{} });
-            },
-            .broadcast_ok => {}, // acks from peers
-            .topology => |t| {
-                // TODO: Assert topology is empty (i.e. it must only be set once).
-                try node.broadcasts_topology.appendSlice(node.allocator, t.topology.map.get(node.id).?);
-                try node.reply(m, .{ .topology_ok = .{} });
-            },
-            // Reply with all received messages.
-            .read => try node.reply(m, .{
-                .read_ok = .{ .messages = node.broadcasts_received.items },
-            }),
-            .init => @panic("Received second init message"),
-            .echo_ok,
-            .init_ok,
-            .generate_ok,
-            .read_ok,
-            .topology_ok,
-            => std.debug.panic("Received unexpected message: {s}", .{@tagName(m.body.extra)}),
+                    },
+                },
+            });
         }
     }
 
@@ -236,41 +267,8 @@ const Message = struct {
             },
             topology_ok: struct {},
 
-            /// Override JSON parsing to account for tagged union nesting.
-            ///
-            /// By default, Zig's JSON parser expects a tagged union to be represented as a nested
-            /// object like `{"tag_name": {...}}`. However, in our message format the union's fields
-            /// exist at the top level (within the `"body"` object). We get around this by manually
-            /// checking the `"type"` field (i.e. our union's tag) then using the default parsing
-            /// for the corresponding type.
-            pub fn jsonParseFromValue(
-                allocator: std.mem.Allocator,
-                value: std.json.Value,
-                options: std.json.ParseOptions,
-            ) !Extra {
-                const kind = value.object.get("type").?.string;
-
-                // TODO: Figure out how to parse messages without ever enabling this option.
-                // // Toggle `ignore_unknown_fields` back to false. See `Body.jsonParse`.
-                // var o = options;
-                // o.ignore_unknown_fields = false;
-
-                // Parse the object to the type that `kind` corresponds to.
-                const type_info = @typeInfo(Extra).@"union";
-                inline for (type_info.fields) |field| if (std.mem.eql(u8, field.name, kind)) {
-                    return @unionInit(
-                        Extra,
-                        field.name,
-                        try std.json.innerParseFromValue(field.type, allocator, value, options),
-                    );
-                };
-
-                return error.UnknownField;
-            }
-
-            /// Override serialisation for the same reasons parsing was overridden above. The
-            /// default nests the union value under the tag. Instead, just serialise the value with
-            /// default serialisation.
+            /// Override serialisation to flatten the tagged union. The default nests the union
+            /// value under the tag. Instead, just serialise the value with default serialisation.
             pub fn jsonStringify(extra: Extra, writer: anytype) !void {
                 // Switch on the tag to get the value and serialise that instead of the whole union.
                 switch (extra) {
@@ -285,29 +283,38 @@ const Message = struct {
         /// around this:
         ///
         /// 1. Parse the common fields (type, msg_id, in_reply_to) manually.
-        /// 2. Use the "type" field to determine which `Extra` union variant to parse.
-        /// 3. Re-parse the whole `"body"` value as the union variant type using default parsing,
-        ///    ignoring unknown fields to skip the common fields we parsed manually.
+        /// 2. Remove common fields from the object so the variant struct parser doesn't see them.
+        /// 3. Parse the variant-specific fields by matching the kind to its struct type.
         pub fn jsonParse(
             allocator: std.mem.Allocator,
             source: anytype,
             options: std.json.ParseOptions,
         ) !Body {
-            // Parse the entire value first
-            const value = try std.json.Value.jsonParse(allocator, source, options);
-            const obj = value.object;
+            var value = try std.json.Value.jsonParse(allocator, source, options);
 
-            // Extract common fields
-            const kind_str = obj.get("type").?.string;
+            // Extract common fields.
+            const kind_str = value.object.get("type").?.string;
             const kind = std.meta.stringToEnum(Kind, kind_str) orelse return error.UnknownField;
-            const msg_id = @as(usize, @intCast(obj.get("msg_id").?.integer));
+            const msg_id = @as(usize, @intCast(value.object.get("msg_id").?.integer));
             const in_reply_to =
-                if (obj.get("in_reply_to")) |v| @as(usize, @intCast(v.integer)) else null;
+                if (value.object.get("in_reply_to")) |v| @as(usize, @intCast(v.integer)) else null;
 
-            // Parse extra fields using the entire `"body"` value, ignoring already parsed fields.
-            var o = options;
-            o.ignore_unknown_fields = true;
-            const extra = try std.json.innerParseFromValue(Extra, allocator, value, o);
+            // Remove common fields so the variant struct parser doesn't see them as unknown.
+            _ = value.object.orderedRemove("type");
+            _ = value.object.orderedRemove("msg_id");
+            _ = value.object.orderedRemove("in_reply_to");
+
+            // Parse variant-specific fields by matching the kind to its struct type.
+            const type_info = @typeInfo(Extra).@"union";
+            const extra: Extra = inline for (type_info.fields) |field| {
+                if (std.mem.eql(u8, field.name, kind_str)) {
+                    break @unionInit(
+                        Extra,
+                        field.name,
+                        try std.json.innerParseFromValue(field.type, allocator, value, options),
+                    );
+                }
+            } else return error.UnknownField;
 
             return Body{
                 .type = kind,
