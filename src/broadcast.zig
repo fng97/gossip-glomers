@@ -8,6 +8,7 @@ test "broadcast workload" {
         "--rate",                    "100",
         "--node-count",              "5",
         "--time-limit",              "3",
+        "--nemesis",                 "partition",
         "--bin=" ++ config.exe_path,
     }, std.testing.allocator);
     child.stdout_behavior = .Ignore;

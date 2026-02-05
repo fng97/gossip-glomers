@@ -43,6 +43,7 @@ fn logFn(
 
 const Node = struct {
     const broadcasts_received_max = 256;
+    const broadcasts_retry_timeout = 200 * std.time.ns_per_ms;
 
     allocator: std.mem.Allocator,
     reader: *std.Io.Reader,
@@ -53,6 +54,11 @@ const Node = struct {
     next_message_id: usize = 1,
     broadcasts_received: std.ArrayList(isize),
     broadcasts_topology: std.ArrayList([]const u8) = .empty,
+    broadcasts_pending: std.AutoHashMap(usize, struct {
+        dest: []const u8,
+        message: isize,
+        time_sent: ?std.time.Instant = null,
+    }),
 
     /// Read and parse the next message (newline-separated). The caller is responsible for calling
     /// `deinit()` on the returned value.
@@ -88,6 +94,7 @@ const Node = struct {
             .writer = writer,
             .id = try allocator.dupe(u8, m.body.extra.init.node_id),
             .broadcasts_received = try .initCapacity(allocator, Node.broadcasts_received_max),
+            .broadcasts_pending = .init(allocator),
         };
 
         try node.reply(m, .{ .init_ok = .{} });
@@ -113,28 +120,22 @@ const Node = struct {
                 for (node.broadcasts_received.items) |received_message| {
                     if (b.message == received_message) break; // we already have this message
                 } else {
-                    // Store message.
-                    node.broadcasts_received.appendAssumeCapacity(b.message);
-                    // Send message to peer nodes according to topology.
-                    for (node.broadcasts_topology.items) |node_id| try node.send(.{
-                        .src = node.id,
-                        .dest = try node.allocator.dupe(u8, node_id),
-                        .body = .{
-                            .type = .broadcast,
-                            .msg_id = node.message_id(),
-                            .in_reply_to = null,
-                            .extra = .{
-                                .broadcast = .{
-                                    .message = b.message,
-                                },
-                            },
-                        },
-                    });
+                    node.broadcasts_received.appendAssumeCapacity(b.message); // store message
+                    // Queue broadcasts to peer nodes (in topology). These get dispatched after this
+                    // switch block.
+                    for (node.broadcasts_topology.items) |node_id| {
+                        try node.broadcasts_pending.put(node.message_id(), .{
+                            .dest = try node.allocator.dupe(u8, node_id),
+                            .message = b.message,
+                        });
+                    }
                 }
 
-                try node.reply(m, .{ .broadcast_ok = .{} });
+                try node.reply(m, .{ .broadcast_ok = .{} }); // always send the ack
             },
-            .broadcast_ok => {}, // acks from peers
+            .broadcast_ok => {
+                _ = node.broadcasts_pending.remove(m.body.in_reply_to.?); // remove acked message
+            },
             .topology => |t| {
                 // TODO: Assert topology is empty (i.e. it must only be set once).
                 try node.broadcasts_topology.appendSlice(node.allocator, t.topology.map.get(node.id).?);
@@ -151,6 +152,36 @@ const Node = struct {
             .read_ok,
             .topology_ok,
             => std.debug.panic("Received unexpected message: {s}", .{@tagName(m.body.extra)}),
+        }
+
+        var broadcasts_pending_itr = node.broadcasts_pending.iterator();
+        broadcast: while (broadcasts_pending_itr.next()) |b| {
+            const broadcast_message_id = b.key_ptr.*;
+            const broadcast = b.value_ptr;
+
+            const now = try std.time.Instant.now();
+            if (broadcast.time_sent) |time_sent| {
+                // Wait between rebroadcasts. If not timed out, check next broadcast message.
+                if (now.since(time_sent) < Node.broadcasts_retry_timeout) continue :broadcast;
+            } else {
+                // This one hasn't been sent yet. Record the time and send it.
+                broadcast.time_sent = now;
+            }
+
+            try node.send(.{
+                .src = node.id,
+                .dest = broadcast.dest,
+                .body = .{
+                    .type = .broadcast,
+                    .msg_id = broadcast_message_id,
+                    .in_reply_to = null,
+                    .extra = .{
+                        .broadcast = .{
+                            .message = broadcast.message,
+                        },
+                    },
+                },
+            });
         }
     }
 
