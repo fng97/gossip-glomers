@@ -1,6 +1,12 @@
 .{
     .name = .gossip_glomers,
     .version = "0.0.0",
+    .dependencies = .{
+        .tidy = .{
+            .url = "git+https://github.com/fng97/tidy.zig#b1ed3a3d23f7bfdb4e318eeed7e707c31def46e3",
+            .hash = "tidy-0.0.1-LZGHAXQuAAC_vBPc4rAGAngwvf4cpStmOWgEJgvMdhso",
+        },
+    },
     .fingerprint = 0xd7b7987d58d159f, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.2",
     .paths = .{

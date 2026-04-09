@@ -250,7 +250,7 @@ const Message = struct {
             ) !Extra {
                 const kind = value.object.get("type").?.string;
 
-                // FIXME: Figure out how to parse messages without ever enabling this option.
+                // TODO: Figure out how to parse messages without ever enabling this option.
                 // // Toggle `ignore_unknown_fields` back to false. See `Body.jsonParse`.
                 // var o = options;
                 // o.ignore_unknown_fields = false;

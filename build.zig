@@ -1,6 +1,8 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    const test_step = b.step("test", "Run tests");
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -14,7 +16,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(node_exe);
 
-    const test_step = b.step("test", "Run tests");
     const node_tests = b.addTest(.{ .name = "node", .root_module = node_exe.root_module });
     const node_tests_run = b.addRunArtifact(node_tests);
     test_step.dependOn(&node_tests_run.step);
@@ -28,6 +29,13 @@ pub fn build(b: *std.Build) void {
     add_maelstrom_test(ctx, "src/echo.zig");
     add_maelstrom_test(ctx, "src/generate.zig");
     add_maelstrom_test(ctx, "src/broadcast.zig");
+
+    test_step.dependOn(blk: {
+        const dep = b.dependency("tidy", .{ .target = b.graph.host, .optimize = .ReleaseSafe });
+        const exe = b.addTest(.{ .name = "tidy checks", .root_module = dep.module("tidy") });
+        const run = b.addRunArtifact(exe);
+        break :blk &run.step;
+    });
 }
 
 fn add_maelstrom_test(
@@ -44,7 +52,6 @@ fn add_maelstrom_test(
     });
     const tests_run = ctx.b.addRunArtifact(tests);
 
-    // Pass the node_exe install path to the maelstrom tests.
     const options = ctx.b.addOptions();
     options.addOption([]const u8, "exe_path", ctx.b.getInstallPath(.bin, ctx.node_exe.name));
     tests.root_module.addOptions("config", options);
